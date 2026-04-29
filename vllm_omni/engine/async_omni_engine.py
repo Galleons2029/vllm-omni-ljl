@@ -3,6 +3,35 @@ Async Omni Engine for vLLM-Omni multi-stage runtime.
 
 AsyncOmniEngine in the caller's thread is a thin proxy that communicates
 with the Orchestrator (running in a background thread) via janus queues.
+
+【架构概览】
+┌─────────────────────────────────────────────────────┐
+│  调用者线程（用户代码 / HTTP 服务器）                  │
+│                                                     │
+│   AsyncOmniEngine.add_request()                     │
+│     ├─ InputProcessor.process_inputs()  ← Stage 0 预处理（tokenize / MM）
+│     └─ request_queue.sync_q.put()       ← 放入 janus 同步队列
+│                                                     │
+│   AsyncOmniEngine.try_get_output()                  │
+│     └─ output_queue.sync_q.get()        ← 从 janus 同步队列取结果
+└─────────────────────────┬───────────────────────────┘
+                          │ janus 队列（线程安全桥接）
+┌─────────────────────────▼───────────────────────────┐
+│  Orchestrator 后台线程（独立 asyncio event loop）      │
+│                                                     │
+│   _request_handler()   ← 消费 request_queue         │
+│   _orchestration_loop()                             │
+│     ├─ poll Stage 0 → 处理输出 → 转发给 Stage 1      │
+│     ├─ poll Stage 1 → 处理输出 → 转发给 Stage 2      │
+│     └─ 最终 Stage 完成 → 写入 output_queue           │
+└─────────────────────────────────────────────────────┘
+
+【关键设计决策】
+- Stage 0 的 InputProcessor（tokenization / 多模态预处理）在调用者线程运行，
+  避免一次额外的队列+协程切换开销。
+- janus.Queue 同时暴露同步 API（sync_q）和异步 API（async_q），
+  使两个不同线程/事件循环可以安全地共享同一条队列。
+- weakref.finalize 确保 GC 时也能触发 Orchestrator 关闭，防止后台线程泄漏。
 """
 
 from __future__ import annotations
@@ -261,6 +290,14 @@ class AsyncOmniEngine:
         init_timeout: Total timeout waiting for orchestrator startup (seconds).
         stage_init_timeout: Timeout for stage initialization (seconds)
         **kwargs: Additional arguments
+
+    【成员生命周期】
+    __init__
+      └─ _resolve_stage_configs()    读取 YAML / 构造默认 diffusion config
+      └─ Thread(_bootstrap_orchestrator).start()   后台线程启动
+            └─ _initialize_stages()  并发启动各 Stage 进程
+            └─ Orchestrator.run()    进入 asyncio 事件循环
+      └─ _wait_for_orchestrator_init()  主线程阻塞等待后台 READY 信号
     """
 
     def __init__(
@@ -680,7 +717,21 @@ class AsyncOmniEngine:
         return stage_client, output_processor, started.vllm_config, input_processor
 
     def _initialize_stages(self, stage_init_timeout: int) -> None:
-        """Initialize stage clients/processors in orchestrator thread and assign to self."""
+        """Initialize stage clients/processors in orchestrator thread and assign to self.
+
+        【并发启动策略】
+        所有 LLM Stage 用 ThreadPoolExecutor 并发启动（spawn_stage_core 是阻塞调用），
+        Diffusion Stage 在 llm_stage_launch_lock 保护下串行启动（需独占设备环境变量）。
+
+        启动分两个阶段：
+          1. launch 阶段：spawn_stage_core / spawn_diffusion_proc 启动子进程，拿到 IPC 地址
+          2. attach 阶段：通过 IPC 地址建立 StageEngineCoreClient，完成握手
+
+        两阶段分离的原因：
+          - launch 需要互斥锁（设置 CUDA_VISIBLE_DEVICES 等设备环境变量）
+          - attach（握手等待）可以并发，不需要锁
+          这样最大化了并行度，缩短总启动时间。
+        """
         device_control_env = current_omni_platform.device_control_env_var
 
         num_stages = self.num_stages
@@ -914,7 +965,18 @@ class AsyncOmniEngine:
         stage_init_timeout: int,
         startup_future: concurrent.futures.Future,
     ) -> None:
-        """Create loop, initialize stages, then run Orchestrator."""
+        """Create loop, initialize stages, then run Orchestrator.
+
+        【为什么需要独立线程 + 独立 event loop】
+        asyncio event loop 不能跨线程使用。Orchestrator 的 _orchestration_loop
+        需要 await 多个 Stage 的 I/O（ZMQ socket），如果放在调用者的 event loop
+        里会阻塞 HTTP 服务器。独立线程+独立 loop 使两者完全隔离。
+
+        【startup_future 机制】
+        后台线程通过 startup_future.set_result() 通知主线程"已就绪"，
+        主线程在 _wait_for_orchestrator_init() 中 future.result(timeout=...) 等待。
+        如果初始化失败，set_exception() 会把异常传回主线程，抛给调用方。
+        """
 
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
@@ -1509,6 +1571,19 @@ class AsyncOmniEngine:
         processor registration happen here in the caller's thread, avoiding
         a queue + coroutine-switch round-trip.  The Orchestrator receives a
         ready-to-submit OmniEngineCoreRequest.
+
+        【执行流程】
+        1. InputProcessor.process_inputs()：tokenization + 多模态预处理（在调用者线程）
+        2. _upgrade_to_omni_request()：把 prompt_embeds / additional_information 补回
+           EngineCoreRequest（vLLM 的 InputProcessor 不认识这些字段，会丢弃）
+        3. output_processors[0].add_request()：注册到 Stage 0 的输出处理器，
+           后续 Orchestrator 轮询到输出时能通过 request_id 找到对应的处理器
+        4. request_queue.sync_q.put_nowait()：把 OmniEngineCoreRequest 投入队列，
+           Orchestrator 的 _request_handler 协程会消费它并提交给 Stage 0
+
+        【final_stage_id 参数】
+        指定请求的最终 stage（默认 0 表示不需要跨 stage）。
+        对于 AR→DiT 管线，final_stage_id=1 意味着 Stage 0 (AR) 的输出还需转发 Stage 1 (DiT)。
         """
         msg = self._build_add_request_message(
             request_id=request_id,

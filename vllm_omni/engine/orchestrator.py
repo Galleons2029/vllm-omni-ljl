@@ -4,6 +4,43 @@ Orchestrator for vLLM-Omni multi-stage runtime.
 Runs inside a background thread with its own asyncio event loop.
 Owns all StageEngineCoreClient instances, input/output processors,
 and handles stage-to-stage transfer logic.
+
+【Orchestrator 在整体架构中的位置】
+
+  AsyncOmniEngine（调用者线程）
+    │  request_queue ──────────────────┐
+    │  output_queue  ◄─────────────────┤
+    │  rpc_output_queue ◄──────────────┤
+    │                                  │
+    └──────────────────────────────────▼
+                            Orchestrator（后台线程 / 独立 asyncio loop）
+                              │
+                   ┌──────────┴──────────┐
+                   ▼                     ▼
+              _request_handler      _orchestration_loop
+              （消费请求队列）        （轮询各 Stage 输出）
+                   │                     │
+              提交请求给 Stage 0    Stage i 有输出？
+                                        ├─ 是最终 Stage → 写 output_queue
+                                        └─ 非最终 Stage → build_engine_core_request_from_tokens
+                                                         → 提交给 Stage i+1
+
+【两个核心协程同时运行（asyncio.gather）】
+  _request_handler：        处理来自主线程的控制消息（add_request / abort / rpc / shutdown）
+  _orchestration_loop：     每轮遍历所有 Stage，轮询输出、路由到下一 Stage 或最终返回
+
+【per-request 状态追踪】
+  request_states: dict[request_id, OrchestratorRequestState]
+    保存每个请求的 prompt、各 Stage 采样参数、提交时间戳等，用于：
+    - Stage 间数据路由（把 Stage i 输出转成 Stage i+1 的输入）
+    - 指标统计（每 Stage 耗时）
+    - 请求完成后清理
+
+【CFG companion 机制】
+  部分扩散模型（如 Wan 视频生成）需要 classifier-free guidance，
+  即同一个请求要同时跑 conditioned + unconditioned 两路。
+  CfgCompanionTracker 负责追踪主请求和 companion 请求的对应关系，
+  在两路都完成后合并结果。
 """
 
 from __future__ import annotations
